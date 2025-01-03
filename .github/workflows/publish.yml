@@ -1,0 +1,27 @@
+name: Publish Docker Image
+
+on:
+  push:
+    branches: ['main']
+
+jobs:
+  push-to-registry:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t ghcr.io/mack-infra/vault-unsealer:latest .
+          docker push ghcr.io/mack-infra/vault-unsealer:latest
