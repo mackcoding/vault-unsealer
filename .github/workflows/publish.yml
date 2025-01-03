@@ -3,6 +3,9 @@ name: Publish Docker Image
 on:
   push:
     branches: ['main']
+    paths:
+      - 'Dockerfile'
+      - 'unsealer.go'
 
 jobs:
   push-to-registry:
@@ -13,14 +16,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+      
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
+          
       - name: Build and push Docker image
         run: |
           docker build -t ghcr.io/mack-infra/vault-unsealer:latest .
