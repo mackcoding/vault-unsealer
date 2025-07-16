@@ -42,7 +42,7 @@ This project was created as my first significant Go script, and I welcome contri
 - Do not add features that could compromise security
 - Maintain the current security practices (in-memory only, no persistent storage)
 
-I appreciate all contributions, whether they're bug fixes, documentation improvements, or feature additions. This is a learning experience for me as well, so constructive feedback is always welcome! 
+I appreciate all contributions, whether they're bug fixes, documentation improvements, or feature additions. This is a learning experience for me as well, so constructive feedback is always welcome!
 
 ## Prerequisites
 - Bitwarden organization account
@@ -64,6 +64,7 @@ I appreciate all contributions, whether they're bug fixes, documentation improve
 | `UNSEAL_KEY_2` | Bitwarden secret ID for second unseal key | `unseal-key-2` |
 | `UNSEAL_KEY_3` | Bitwarden secret ID for third unseal key | `unseal-key-3` |
 | `UNSEAL_KEY_4` | Bitwarden secret ID for fourth unseal key | `unseal-key-4` |
+| `VERIFY_CERT` | Enables cert verification, set to `false` when using self-signed certificates | `true` |
 
 ## Usage
 
