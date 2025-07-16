@@ -128,7 +128,11 @@ func getVariables() (apiUrl string, identityUrl string, vaultUrls []string, orgI
 		exitUnsealer("access token exceeds maximum length of %d characters", maxTokenLength)
 	}
 
-	verifyCert = getEnv("VERIFY_CERT")
+	verifyCert = strings.ToLower(os.Getenv("VERIFY_CERT"))
+
+	if verifyCert == "" {
+		verifyCert = "true"
+	}
 
 	log("getVariables", "API_URL: %s", apiUrl)
 	log("getVariables", "IDENTITY_URL: %s", identityUrl)
@@ -187,7 +191,7 @@ func exitUnsealer(format string, args ...interface{}) {
 func unsealVault(keys []string, urls []string, verifyCert string) {
 	log("unsealVault", "Unsealing vault...")
 
-	skipVerify := strings.ToLower(verifyCert) == "false"
+	skipVerify := verifyCert == "false"
 
 	client := &http.Client{
 		Timeout: clientTimeout,
