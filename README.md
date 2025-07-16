@@ -85,6 +85,7 @@ docker run --rm \
   -e UNSEAL_KEY_2="secret_id_2" \
   -e UNSEAL_KEY_3="secret_id_3" \
   -e UNSEAL_KEY_4="secret_id_4" \
+  -e VERIFY_CERT="true" \
   vault-unsealer
 ```
 
@@ -137,6 +138,10 @@ Contributions are welcome! Please note:
 - Pull requests should not modify the core unsealing logic without discussion
 
 ## Version History
+- 1.0.1: Certificate verification
+  - Enables self-signed certificates
+  - Adds a new variable, `VERIFY_CERT`
+
 - 1.0.0: Initial release
   - Basic unsealing functionality
   - Environment variable configuration
