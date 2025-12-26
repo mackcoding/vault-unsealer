@@ -33,6 +33,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value={{tag}}
             type=edge,branch=main
 
       - name: Build and push Docker image
