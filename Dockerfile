@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25.5-alpine AS builder
 
 # Install build dependencies required for CGO (Bitwarden SDK)
 RUN apk add --no-cache gcc musl-dev git

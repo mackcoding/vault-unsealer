@@ -1,4 +1,4 @@
-module unsealer.go
+module github.com/mackcoding/vault-unsealer
 
 go 1.25.5
 
