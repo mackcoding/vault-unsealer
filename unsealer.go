@@ -54,6 +54,8 @@ func main() {
 	}
 	orgID := getEnvRequired("ORGANIZATION_ID")
 	token := getEnvRequired("ACCESS_TOKEN")
+	apiURL := getEnv("API_URL", "")
+	identityURL := getEnv("IDENTITY_URL", "")
 
 	pollIntStr := getEnv("POLL_INTERVAL", "60s")
 	pollInt, err := time.ParseDuration(pollIntStr)
