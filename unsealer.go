@@ -1,25 +1,3 @@
-// MIT License
-//
-// Copyright (c) 2024 Thomas Mack (https://github.com/mackcoding)
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
 package main
 
 import (
@@ -29,218 +7,403 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	sdk "github.com/bitwarden/sdk-go"
+	"github.com/hashicorp/go-hclog"
 )
 
-const (
-	logDateFormat      = "1/2/2006 3:04 PM"
-	maxURLLength       = 2048
-	maxTokenLength     = 1024
-	clientTimeout      = 30 * time.Second
-	requiredUnsealKeys = 4
-)
+type Unsealer struct {
+	logger       hclog.Logger
+	client       *http.Client
+	bw           sdk.BitwardenClientInterface
+	keys         []string
+	keysMu       sync.RWMutex
+	vaults       []string
+	attempts     int64
+	successes    int64
+	failures     int64
+	working      sync.Map
+	wg           sync.WaitGroup
+	orgID        string
+	token        string
+	apiURL       string
+	identityURL  string
+	healthServer *http.Server
+}
 
 func main() {
-	log("init", "Initializing unsealer...")
+	log := hclog.New(&hclog.LoggerOptions{Name: "vault-unsealer", Level: hclog.Info})
 
-	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
-	defer cancel()
-
-	apiUrl, identityUrl, vaultUrls, orgId, token, verifyCert := getVariables()
-
-	bwClient, err := getClient(ctx, apiUrl, identityUrl, token, orgId)
-	if err != nil {
-		exitUnsealer("failed to initialize client: %v", err)
-	}
-
-	unsealKeys, err := getUnsealKeys(ctx, bwClient)
-	if err != nil {
-		exitUnsealer("failed to get unseal keys: %v", err)
-	}
-
-	log("init", "Successfully retrieved %d unseal keys", len(unsealKeys))
-	unsealVault(unsealKeys, vaultUrls, verifyCert)
-
-	os.Exit(0)
-}
-
-func validateURL(urlStr string) error {
-	if len(urlStr) > maxURLLength {
-		return fmt.Errorf("URL exceeds maximum length of %d characters", maxURLLength)
-	}
-	_, err := url.Parse(urlStr)
-	return err
-}
-
-func validateVaultURLs(urls []string) error {
-	for _, u := range urls {
-		if err := validateURL(u); err != nil {
-			return fmt.Errorf("invalid vault URL %s: %v", u, err)
+	vaultsRaw := strings.Split(getEnvRequired("VAULT_URLS"), ",")
+	vaults := make([]string, 0, len(vaultsRaw))
+	for _, v := range vaultsRaw {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			vaults = append(vaults, trimmed)
 		}
 	}
-	return nil
-}
+	if len(vaults) == 0 {
+		log.Error("no valid vault URLs provided")
+		os.Exit(1)
+	}
+	orgID := getEnvRequired("ORGANIZATION_ID")
+	token := getEnvRequired("ACCESS_TOKEN")
 
-func getClient(ctx context.Context, apiUrl string, identityUrl string, token string, orgId string) (sdk.BitwardenClientInterface, error) {
-	log("getClient", "creating new bitwarden client")
-	bwClient, err := sdk.NewBitwardenClient(&apiUrl, &identityUrl)
+	pollIntStr := getEnv("POLL_INTERVAL", "60s")
+	pollInt, err := time.ParseDuration(pollIntStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Bitwarden client: %v", err)
+		log.Warn("invalid POLL_INTERVAL, defaulting to 60s", "error", err)
+		pollInt = 60 * time.Second
+	}
+	if pollInt < time.Second {
+		log.Warn("POLL_INTERVAL too short, enforcing 1s minimum")
+		pollInt = time.Second
 	}
 
-	err = bwClient.AccessTokenLogin(token, &orgId)
-	if err != nil {
-		return nil, fmt.Errorf("failed to login with access token: %v", err)
-	}
+	verifyCert := getEnv("VERIFY_CERT", "true") == "true"
 
-	return bwClient, nil
-}
-
-func getVariables() (apiUrl string, identityUrl string, vaultUrls []string, orgId string, token string, verifyCert string) {
-	apiUrl = getEnv("API_URL")
-	if err := validateURL(apiUrl); err != nil {
-		exitUnsealer("invalid API URL: %v", err)
-	}
-
-	identityUrl = getEnv("IDENTITY_URL")
-	if err := validateURL(identityUrl); err != nil {
-		exitUnsealer("invalid Identity URL: %v", err)
-	}
-
-	vaultUrlsStr := getEnv("VAULT_URLS")
-	vaultUrls = strings.Split(vaultUrlsStr, ",")
-	if err := validateVaultURLs(vaultUrls); err != nil {
-		exitUnsealer("invalid Vault URLs: %v", err)
-	}
-
-	orgId = getEnv("ORGANIZATION_ID")
-	if orgId == "" {
-		exitUnsealer("organization ID cannot be empty")
-	}
-
-	token = getEnv("ACCESS_TOKEN")
-	if len(token) > maxTokenLength {
-		exitUnsealer("access token exceeds maximum length of %d characters", maxTokenLength)
-	}
-
-	verifyCert = strings.ToLower(os.Getenv("VERIFY_CERT"))
-
-	if verifyCert == "" {
-		verifyCert = "true"
-	}
-
-	log("getVariables", "API_URL: %s", apiUrl)
-	log("getVariables", "IDENTITY_URL: %s", identityUrl)
-	log("getVariables", "VAULT_URLS: %v", vaultUrls)
-	log("getVariables", "ORGANIZATION_ID: %s", orgId)
-	log("getVariables", "ACCESS_TOKEN: [length=%d]", len(token))
-	log("getVariables", "VERIFY_CERT: %s", verifyCert)
-	return
-}
-
-func getUnsealKeys(ctx context.Context, bwClient sdk.BitwardenClientInterface) ([]string, error) {
-	unsealKeys := make([]string, 0, requiredUnsealKeys)
-
-	for i := 1; i <= requiredUnsealKeys; i++ {
-		unsealKey := getEnv(fmt.Sprintf("UNSEAL_KEY_%d", i))
-
-		key, err := bwClient.Secrets().Get(unsealKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve unseal key %d: %v", i, err)
-		}
-
-		if key.Value == "" {
-			return nil, fmt.Errorf("empty unseal key received for key %d", i)
-		}
-
-		log("getUnsealKeys", "UNSEAL_KEY_%d: [length=%d]", i, len(key.Value))
-		unsealKeys = append(unsealKeys, key.Value)
-	}
-
-	if len(unsealKeys) != requiredUnsealKeys {
-		return nil, fmt.Errorf("incorrect number of unseal keys: got %d, want %d", len(unsealKeys), requiredUnsealKeys)
-	}
-
-	return unsealKeys, nil
-}
-
-func log(action string, format string, args ...interface{}) {
-	date := time.Now().Format(logDateFormat)
-	msg := fmt.Sprintf(format, args...)
-	fmt.Printf("(%s) [%s]: %s\n", date, action, msg)
-}
-
-func getEnv(name string) string {
-	env := os.Getenv(name)
-	if env == "" {
-		exitUnsealer("required environment variable not set: %s", name)
-	}
-	return env
-}
-
-func exitUnsealer(format string, args ...interface{}) {
-	log("FATAL", format, args...)
-	os.Exit(1)
-}
-
-func unsealVault(keys []string, urls []string, verifyCert string) {
-	log("unsealVault", "Unsealing vault...")
-
-	skipVerify := verifyCert == "false"
-
-	client := &http.Client{
-		Timeout: clientTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: skipVerify,
+	u := &Unsealer{
+		logger:      log,
+		vaults:      vaults,
+		orgID:       orgID,
+		token:       token,
+		apiURL:      apiURL,
+		identityURL: identityURL,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+				TLSClientConfig:       &tls.Config{InsecureSkipVerify: !verifyCert},
 			},
 		},
 	}
 
-	for _, addr := range urls {
-		for i, key := range keys {
-			payload := map[string]string{
-				"key": key,
+	if err := u.initBitwardenClient(); err != nil {
+		log.Error("bitwarden init failed", "error", err)
+		os.Exit(1)
+	}
+
+	if err := u.fetchKeys(); err != nil {
+		log.Error("failed to fetch keys", "error", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	u.initHealthServer()
+	go u.startHealthServer()
+	go u.keyRefreshLoop(ctx)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	ticker := time.NewTicker(pollInt)
+	defer ticker.Stop()
+
+	u.unsealAll(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("waiting for in-flight unseals to complete")
+			u.wg.Wait()
+			log.Info("shutting down health server")
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := u.healthServer.Shutdown(shutdownCtx); err != nil {
+				log.Error("health server shutdown failed", "error", err)
 			}
-
-			jsonData, err := json.Marshal(payload)
-			if err != nil {
-				exitUnsealer("failed to marshal unseal payload: %v", err)
+			return
+		case <-sig:
+			log.Info("shutting down")
+			cancel()
+			u.wg.Wait()
+			log.Info("shutting down health server")
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			if err := u.healthServer.Shutdown(shutdownCtx); err != nil {
+				log.Error("health server shutdown failed", "error", err)
 			}
+			return
+		case <-ticker.C:
+			u.unsealAll(ctx)
+		}
+	}
+}
 
-			req, err := http.NewRequest("PUT", fmt.Sprintf("%s/v1/sys/unseal", addr), bytes.NewBuffer(jsonData))
-			if err != nil {
-				exitUnsealer("failed to create request: %v", err)
+func (u *Unsealer) initBitwardenClient() error {
+	var err error
+	if u.apiURL != "" && u.identityURL != "" {
+		u.bw, err = sdk.NewBitwardenClient(&u.apiURL, &u.identityURL)
+	} else {
+		u.bw, err = sdk.NewBitwardenClient(nil, nil)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create client: %w", err)
+	}
+
+	if err := u.bw.AccessTokenLogin(u.token, &u.orgID); err != nil {
+		return fmt.Errorf("login failed: %w", err)
+	}
+
+	return nil
+}
+
+func (u *Unsealer) fetchKeys() error {
+	return u.doFetchKeys(true)
+}
+
+func (u *Unsealer) doFetchKeys(allowRelogin bool) error {
+	// Note: Bitwarden SDK doesn't support context timeouts
+	// If this hangs, the entire refresh loop blocks
+	keys := make([]string, 0, 4)
+
+	for i := 1; i <= 4; i++ {
+		keyName := fmt.Sprintf("UNSEAL_KEY_%d", i)
+		keyID := os.Getenv(keyName)
+		if keyID == "" {
+			return fmt.Errorf("environment variable %s not set", keyName)
+		}
+
+		secret, err := u.bw.Secrets().Get(keyID)
+		if err != nil {
+			if allowRelogin && (strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "auth")) {
+				u.logger.Warn("authentication error detected, attempting re-login")
+				if reloginErr := u.initBitwardenClient(); reloginErr != nil {
+					return fmt.Errorf("re-login failed: %w", reloginErr)
+				}
+				return u.doFetchKeys(false)
 			}
+			return fmt.Errorf("failed to get key %d: %w", i, err)
+		}
+		if secret.Value == "" {
+			return fmt.Errorf("empty value for key %d", i)
+		}
+		keys = append(keys, secret.Value)
+	}
 
-			req.Header.Set("Content-Type", "application/json")
+	u.keysMu.Lock()
+	u.keys = keys
+	u.keysMu.Unlock()
 
-			resp, err := client.Do(req)
-			if err != nil {
-				exitUnsealer("failed to send unseal request to %s with key %d: %v", addr, i+1, err)
-			}
-			defer resp.Body.Close()
+	u.logger.Info("loaded keys", "count", len(keys))
+	return nil
+}
 
-			if resp.StatusCode != http.StatusOK {
-				exitUnsealer("unseal request %d failed with status: %s for node %s", i+1, resp.Status, addr)
-			}
+func (u *Unsealer) keyRefreshLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			u.logger.Error("panic in key refresh loop", "panic", r)
+		}
+	}()
 
-			var result map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-				exitUnsealer("failed to decode response: %v", err)
-			}
-
-			if sealed, ok := result["sealed"].(bool); ok && !sealed {
-				log("unsealVault", "node %s unsealed successfully", addr)
-				break
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Hour):
+			if err := u.fetchKeys(); err != nil {
+				u.logger.Error("key refresh failed", "error", err)
+			} else {
+				u.logger.Info("keys refreshed")
 			}
 		}
 	}
+}
 
-	log("unsealVault", "vault unsealing completed successfully")
+func (u *Unsealer) unsealAll(ctx context.Context) {
+	for _, vault := range u.vaults {
+		u.wg.Add(1)
+		go func(addr string) {
+			defer u.wg.Done()
+			u.unsealWithRetry(ctx, addr)
+		}(vault)
+	}
+}
+
+func (u *Unsealer) unsealWithRetry(ctx context.Context, addr string) {
+	defer func() {
+		if r := recover(); r != nil {
+			u.logger.Error("panic in unseal retry", "vault", addr, "panic", r)
+			atomic.AddInt64(&u.failures, 1)
+		}
+	}()
+
+	if _, exists := u.working.LoadOrStore(addr, true); exists {
+		u.logger.Debug("unseal already in progress for vault", "vault", addr)
+		return
+	}
+	defer u.working.Delete(addr)
+
+	backoff := time.Second
+	for i := 0; i < 3; i++ {
+		if err := u.unseal(ctx, addr); err == nil {
+			return
+		} else if i < 2 {
+			u.logger.Warn("unseal attempt failed, retrying", "vault", addr, "attempt", i+1, "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				backoff *= 2
+			}
+		}
+	}
+	atomic.AddInt64(&u.failures, 1)
+}
+
+func (u *Unsealer) unseal(ctx context.Context, addr string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", addr+"/v1/sys/health", nil)
+	if err != nil {
+		return fmt.Errorf("invalid vault URL: %w", err)
+	}
+
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("health check failed: %w", err)
+	}
+	resp.Body.Close()
+
+	switch resp.StatusCode {
+	case 200, 429, 472, 473:
+		return nil
+	case 503:
+		// Sealed, continue to unseal
+	default:
+		return fmt.Errorf("vault unhealthy, status code: %d", resp.StatusCode)
+	}
+
+	atomic.AddInt64(&u.attempts, 1)
+	u.logger.Info("unsealing", "vault", addr)
+
+	u.keysMu.RLock()
+	keys := u.keys
+	u.keysMu.RUnlock()
+
+	for i, key := range keys {
+		if i > 0 {
+			req, err := http.NewRequestWithContext(ctx, "GET", addr+"/v1/sys/health", nil)
+			if err == nil {
+				resp, err := u.client.Do(req)
+				if err == nil {
+					resp.Body.Close()
+					switch resp.StatusCode {
+					case 200, 429, 472, 473:
+						u.logger.Info("unsealed (quorum)", "vault", addr)
+						atomic.AddInt64(&u.successes, 1)
+						return nil
+					}
+				}
+			}
+		}
+
+		data, err := json.Marshal(map[string]string{"key": key})
+		if err != nil {
+			u.logger.Warn("failed to marshal unseal request", "vault", addr, "error", err)
+			continue
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "PUT", addr+"/v1/sys/unseal", bytes.NewBuffer(data))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := u.client.Do(req)
+		if err != nil {
+			continue
+		}
+
+		var result map[string]interface{}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+
+		if decodeErr != nil {
+			u.logger.Warn("bad response from vault", "vault", addr, "error", decodeErr)
+			continue
+		}
+
+		if sealed, ok := result["sealed"].(bool); ok && !sealed {
+			u.logger.Info("unsealed", "vault", addr)
+			atomic.AddInt64(&u.successes, 1)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("failed to unseal")
+}
+
+func (u *Unsealer) initHealthServer() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		u.keysMu.RLock()
+		ready := len(u.keys) > 0
+		u.keysMu.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if !ready {
+			w.WriteHeader(503)
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ready": ready})
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int64{
+			"unseal_attempts":  atomic.LoadInt64(&u.attempts),
+			"unseal_successes": atomic.LoadInt64(&u.successes),
+			"unseal_failures":  atomic.LoadInt64(&u.failures),
+		})
+	})
+
+	u.healthServer = &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+}
+
+func (u *Unsealer) startHealthServer() {
+	defer func() {
+		if r := recover(); r != nil {
+			u.logger.Error("panic in health server", "panic", r)
+		}
+	}()
+
+	u.logger.Info("health server starting", "addr", ":8080")
+	if err := u.healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		u.logger.Error("health server failed", "error", err)
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func getEnvRequired(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		panic(fmt.Sprintf("required environment variable %s not set", key))
+	}
+	return v
 }

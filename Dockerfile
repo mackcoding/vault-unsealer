@@ -1,27 +1,40 @@
-FROM golang:alpine AS builder
+FROM golang:1.22-alpine AS builder
 
-# Install build dependencies 
-RUN apk add --no-cache gcc musl-dev
-
-WORKDIR /build
-COPY unsealer.go .
-
-# Build the binary
-RUN go mod init unsealer && \
-    go mod tidy && \
-    CGO_ENABLED=1 go build -ldflags '-extldflags "-static"' -o unsealer
-
-FROM alpine:latest
-
-# Install Bitwarden CLI
-RUN apk add --no-cache curl unzip && \
-    curl -L "https://vault.bitwarden.com/download/?app=cli&platform=linux" -o bw.zip && \
-    unzip bw.zip && \
-    chmod +x bw && \
-    mv bw /usr/local/bin/ && \
-    rm bw.zip
+# Install build dependencies required for CGO (Bitwarden SDK)
+RUN apk add --no-cache gcc musl-dev git
 
 WORKDIR /app
-COPY --from=builder /build/unsealer .
 
-ENTRYPOINT ["/app/unsealer"]
+# Copy dependency definitions
+COPY go.mod ./
+
+# Download dependencies (and generate go.sum if missing)
+RUN go mod tidy && go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary with CGO enabled (required for Bitwarden SDK)
+# -ldflags "-s -w" strips debug information for a smaller binary
+RUN CGO_ENABLED=1 go build -ldflags "-s -w" -o vault-unsealer .
+
+# Final stage
+FROM alpine:latest
+
+# Install CA certificates for HTTPS and wget for healthcheck
+RUN apk add --no-cache ca-certificates wget
+
+WORKDIR /app
+
+# Copy the binary from the builder stage
+COPY --from=builder /app/vault-unsealer .
+
+# Expose the health check port
+EXPOSE 8080
+
+# Add health check using the built-in health endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Run the binary
+ENTRYPOINT ["/app/vault-unsealer"]
