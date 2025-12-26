@@ -22,7 +22,7 @@ RUN CGO_ENABLED=1 go build -ldflags "-s -w" -o vault-unsealer .
 FROM alpine:latest
 
 # Install CA certificates for HTTPS and wget for healthcheck
-RUN apk add --no-cache ca-certificates wget
+RUN apk add --no-cache ca-certificates wget libgcc
 
 WORKDIR /app
 
